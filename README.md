@@ -1,0 +1,1 @@
+# lab_receipt_bot
