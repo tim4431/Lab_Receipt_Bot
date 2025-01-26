@@ -1,0 +1,5 @@
+streamlit
+pydantic
+pdf2image
+openai
+pyyaml
