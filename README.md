@@ -33,6 +33,9 @@ invoice_analysis_prompt: |
     "rationale": "short summary or fallback"
   }}
 
+summary_prompt: |
+  Please describe the main thing of the purchase in a very precise sentence, use "and" to connect multiple items.
+  Here are the rationales:
 
 contacts:
   - name: "PhD"
