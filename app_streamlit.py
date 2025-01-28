@@ -4,13 +4,10 @@ import yaml
 import smtplib
 import ssl
 import hashlib
-import shutil
 from email.message import EmailMessage
 import streamlit as st
 import base64
-import io
 import tempfile
-import time
 from pydantic import BaseModel
 
 from pdf2image import convert_from_bytes  # pip install pdf2image
@@ -48,7 +45,7 @@ client = OpenAI(api_key=OPENAI_APIKEY)
 
 def encode_image(image_path):
     """
-    Utility to read an image file from disk and return its base64-encoded string.
+    Read an image file from disk and return its base64-encoded string.
     """
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
@@ -57,31 +54,28 @@ def encode_image(image_path):
 def parse_invoice_pdf_with_gpt4o(uploaded_pdf):
     """
     1) Convert PDF to images (one per page).
-    2) For each page, call gpt-4o-mini with the image.
-    3) Combine the JSON results to find a final amount and rationale.
+    2) For each page, call GPT with the base64 image for invoice info.
+    3) Sum up amounts & combine rationales for the entire PDF.
     """
-    pdf_bytes = uploaded_pdf.read()  # read the entire PDF
-    uploaded_pdf.seek(0)  # reset pointer so we can attach it later
+    st.info(f"Processing invoices: {uploaded_pdf.name}")
+    pdf_bytes = uploaded_pdf.read()
+    uploaded_pdf.seek(0)  # reset pointer so we can re-attach the file
 
-    # Convert PDF pages to PIL images
     images = convert_from_bytes(pdf_bytes)
 
-    # Create a temporary directory that will be cleaned up automatically
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # We'll collect amounts/rationales from each page
         amounts = []
         rationales = []
 
         for idx, img in enumerate(images):
-            # Save the page as an image in the temporary directory
+            # Save page to disk
             page_path = os.path.join(tmp_dir, f"page_{idx+1}.png")
             img.save(page_path, "PNG")
-            print(f"Saved page {idx+1} to {page_path}")
 
-            # Encode the image in Base64
+            # Convert to base64
             base64_image = encode_image(page_path)
 
-            # Make the request to the "gpt-4o-mini" model
+            # Send request to GPT-4o
             response = client.beta.chat.completions.parse(
                 model="gpt-4o-mini",
                 messages=[
@@ -104,14 +98,10 @@ def parse_invoice_pdf_with_gpt4o(uploaded_pdf):
                 response_format=Invoice,
             )
 
-            # Parse out the GPT result
             page_result = response.choices[0].message.content.strip()
-            print(f"Page {idx+1} result: {page_result}")
-
             try:
-                # Expect valid JSON with "amount" and "rationale"
                 parsed = json.loads(page_result)
-                amt_str = parsed.get("amount", "0.0")
+                amt_str = parsed.get("amount", 0.0)
                 rat = parsed.get("rationale", "")
                 amounts.append(float(amt_str))
                 rationales.append(rat)
@@ -119,45 +109,105 @@ def parse_invoice_pdf_with_gpt4o(uploaded_pdf):
                 amounts.append(0.0)
                 rationales.append(f"Error parsing page {idx+1}: {e}")
 
-        # Combine or pick the "largest" amount found across pages (naive approach)
-        final_amount = max(amounts) if amounts else 0.0
-        # Join rationales for all pages, or just pick the last
-        final_rationale = " | ".join(rationales) if rationales else ""
+        # Summation across all pages of a single PDF
+        final_amount = sum(amounts)
+        final_rationale = " | ".join(rationales)
+        st.success(f"**Parsed Amount:** ${final_amount:,.2f}")
+        st.success(f"**Rationale:** {final_rationale}")
 
     return final_amount, final_rationale
 
 
 def parse_invoice_with_llm(uploaded_file):
     """
-    Dispatch to either PDF parsing or single-image parsing with GPT-4o.
+    Dispatch to PDF parsing. Extend for other file types if needed.
     """
-    file_type = uploaded_file.type.lower()
-    if file_type == "application/pdf":
+    if uploaded_file.type.lower() == "application/pdf":
         return parse_invoice_pdf_with_gpt4o(uploaded_file)
     else:
         raise ValueError("Unsupported file type. Please upload a PDF.")
 
 
+def summarize_rationales_with_llm(rationales_list):
+    """
+    GPT call to produce a single-sentence summary describing the main purchase,
+    including the manufacturer or brand, from multiple rationales.
+    """
+    st.info("Summarizing multiple invoices...")
+    try:
+        prompt_text = (
+            "Please describe the main thing of the purchase in a very precise sentence.\n\n"
+            "Here are the rationales:\n"
+            + "\n".join(f"- {rat}" for rat in rationales_list)
+        )
+
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt_text}],
+        )
+
+        summary = response.choices[0].message.content.strip()
+        # st.success(f"**LLM Summary:** {summary}")
+    except Exception as e:
+        st.error(f"Error summarizing rationales: {e}")
+    return summary
+
+
+def parse_multiple_invoices_with_llm(uploaded_files):
+    """
+    For multiple PDFs:
+      - Parse each
+      - Sum total amounts
+      - If more than one PDF, produce a single-sentence summary of them all.
+        Otherwise, just use that single PDF's rationale.
+    """
+    # Build hash to detect changes in the set of files
+    hash_md5 = hashlib.md5()
+    for f in uploaded_files:
+        file_bytes = f.read()
+        hash_md5.update(file_bytes)
+        f.seek(0)
+    new_files_hash = hash_md5.hexdigest()
+
+    # Check if we already parsed these files
+    if st.session_state.get("parsed_files_hash") == new_files_hash:
+        # Return existing results
+        return (
+            st.session_state["invoice_amount"],
+            st.session_state["invoice_rationale"],
+            new_files_hash,
+        )
+
+    # Otherwise, parse from scratch
+    total_amount = 0.0
+    all_rationales = []
+    for f in uploaded_files:
+        amt, rat = parse_invoice_with_llm(f)
+        total_amount += amt
+        all_rationales.append(rat)
+
+    # If only one file, just use its single rationale
+    if len(uploaded_files) == 1:
+        combined_rationale_summary = all_rationales[0]
+    else:
+        # Summarize multiple rationales into one single-sentence summary
+        combined_rationale_summary = summarize_rationales_with_llm(all_rationales)
+
+    return total_amount, combined_rationale_summary, new_files_hash
+
+
 # ---------------------------
 # 3) Email Sending Function
 # ---------------------------
-def send_email_via_gmail(to_emails, cc_emails, subject, body, attachment_file=None):
+def send_email_via_gmail(to_emails, cc_emails, subject, body, attachment_files=None):
     """
-    Sends an email via Gmail with an optional attachment (PDF or image).
-
-    Args:
-        to_emails (list[str]): List of recipient emails (the "To" field).
-        cc_emails (list[str]): List of CC emails.
-        subject (str): Email subject.
-        body (str): Email body.
-        attachment_file: A file-like object to attach, or None.
+    Sends an email via Gmail with an optional list of attachments (PDFs, images, etc.).
     """
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = SENDER_USERNAME  # Always from your Gmail account
+    msg["From"] = SENDER_USERNAME
     msg["To"] = ", ".join(to_emails)
 
-    # Remove duplicates in CC while preserving order
     if cc_emails:
         unique_cc = []
         for c in cc_emails:
@@ -166,31 +216,27 @@ def send_email_via_gmail(to_emails, cc_emails, subject, body, attachment_file=No
         if unique_cc:
             msg["Cc"] = ", ".join(unique_cc)
 
-    # print(msg["To"])
-
     msg.set_content(body)
 
-    # Attach the original file if provided
-    if attachment_file:
-        file_bytes = attachment_file.read()
-        attachment_file.seek(0)
-        filename = attachment_file.name or "invoice.pdf"
-        msg.add_attachment(
-            file_bytes,
-            maintype="application",
-            subtype="octet-stream",
-            filename=filename,
-        )
-    # print("attachment added")
-    #
-    # F**k google, it needs 2FA
+    # Attach files
+    if attachment_files:
+        for f in attachment_files:
+            file_bytes = f.read()
+            f.seek(0)
+            filename = f.name or "invoice.pdf"
+            msg.add_attachment(
+                file_bytes,
+                maintype="application",
+                subtype="octet-stream",
+                filename=filename,
+            )
+
     context = ssl.create_default_context()
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
             server.login(SENDER_USERNAME, SENDER_PASSWORD)
             server.send_message(msg)
     except smtplib.SMTPAuthenticationError as e:
-        # Often indicates a bad username/password or missing App Password setup
         raise Exception(f"SMTP Error: {e}")
 
 
@@ -211,77 +257,73 @@ def run_streamlit_app():
         st.session_state["invoice_amount"] = 0.0
     if "invoice_rationale" not in st.session_state:
         st.session_state["invoice_rationale"] = ""
-    if "parsed_file_hash" not in st.session_state:
-        st.session_state["parsed_file_hash"] = None
+    if "parsed_files_hash" not in st.session_state:
+        st.session_state["parsed_files_hash"] = None
 
     # ----------------------
     # A) Select Purchaser
     # ----------------------
-    # The purchaser is always one of the "purchaser_names".
     purchaser_name = st.selectbox("Purchaser", purchaser_names)
     purchaser_email = next(
         (x["email"] for x in CONTACTS if x["name"] == purchaser_name), ""
     )
 
     # ----------------------
-    # B) Multi-select "To" recipients, ensuring purchaser is included
+    # B) Multi-select "To" recipients (admin + purchaser)
     # ----------------------
-    # Let the user pick multiple recipients from contact_names
     selected_to_names = st.multiselect(
         "To Recipients",
-        options=[name for name in admin_names],
-        # default=[purchaser_name],
+        options=admin_names,
         help="Choose all recipients for the To field.",
     )
-    # Force the purchaser to be in the list if not manually selected
-    to_name_string = ", ".join(selected_to_names)
-    selected_to_names.append(purchaser_name)
+    if purchaser_name not in selected_to_names:
+        selected_to_names.append(purchaser_name)
 
-    # Convert these "To" names to emails
     to_emails = []
     for name in selected_to_names:
-        c = next((x for x in CONTACTS if x["name"] == name), None)
-        if c and c.get("email"):
-            to_emails.append(c["email"])
+        contact = next((x for x in CONTACTS if x["name"] == name), None)
+        if contact and contact.get("email"):
+            to_emails.append(contact["email"])
 
     # ----------------------
-    # C) Upload Invoice (PDF)
+    # C) Upload multiple Invoices (PDFs)
     # ----------------------
-    uploaded_invoice = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
+    uploaded_invoices = st.file_uploader(
+        "Upload Invoice(s) (PDF)", type=["pdf"], accept_multiple_files=True
+    )
 
-    # Parse with LLM if needed
-    if uploaded_invoice is not None:
-        file_bytes = uploaded_invoice.getvalue()
-        new_file_hash = hashlib.md5(file_bytes).hexdigest()
-
-        if st.session_state["parsed_file_hash"] != new_file_hash:
-            # Parse again
-            amount, rationale = parse_invoice_with_llm(uploaded_invoice)
-            st.session_state["invoice_amount"] = amount
-            st.session_state["invoice_rationale"] = rationale
-            st.session_state["parsed_file_hash"] = new_file_hash
+    # ----------------------
+    # D) LLM Processing Button
+    # Only parse after user clicks "Process with LLM"
+    # ----------------------
+    if st.button("Process with LLM"):
+        if not uploaded_invoices:
+            st.error("Please upload at least one invoice first.")
         else:
-            # Reuse existing parse
-            amount = st.session_state["invoice_amount"]
-            rationale = st.session_state["invoice_rationale"]
-
-        # Show results
-        if st.session_state["invoice_amount"] > 0:
-            st.success(
-                f"**Extracted Amount:** ${st.session_state['invoice_amount']:,.2f}"
+            # Parse + Summarize
+            total_amount, final_summary, new_files_hash = (
+                parse_multiple_invoices_with_llm(uploaded_invoices)
             )
-        else:
-            st.warning("No valid amount parsed.")
 
-        if st.session_state["invoice_rationale"]:
-            st.success(
-                f"**Extracted Rationale:** {st.session_state['invoice_rationale']}"
-            )
-        else:
-            st.warning("No rationale parsed.")
+            # Store results
+            st.session_state["invoice_amount"] = total_amount
+            st.session_state["invoice_rationale"] = final_summary
+            st.session_state["parsed_files_hash"] = new_files_hash
+
+            # Show results
+            if total_amount > 0:
+                st.success(f"**Combined Amount:** ${total_amount:,.2f}")
+            else:
+                st.warning("No valid amount parsed.")
+
+            if final_summary:
+                st.success("**Rationale**:\n" f"{final_summary}")
+            else:
+                st.warning("No rationale parsed or summarized.")
 
     # ----------------------
-    # D) Grant Selection
+    # E) Grant Selection
+    # ----------------------
     grant_names = [g["name"] for g in GRANTS]
     grant_selected_name = st.selectbox("Grant", grant_names)
     grant_code = next(
@@ -290,11 +332,11 @@ def run_streamlit_app():
     st.session_state["grant_code"] = grant_code
 
     # ----------------------
-    # E) CC Recipients
+    # F) CC Recipients
     # ----------------------
     cc_selected_names = st.multiselect(
         "CC Recipients",
-        options=[n for n in contact_names],
+        options=contact_names,
         default=["rydberglabreceipts"] if "rydberglabreceipts" in contact_names else [],
         help="Optional: pick additional recipients to CC.",
     )
@@ -305,41 +347,50 @@ def run_streamlit_app():
             cc_emails.append(c["email"])
 
     # ----------------------
-    # F) Subject & Body
+    # G) Subject & Body
     # ----------------------
-    subject = f"PCard_Simon Group_AMOUNT_{st.session_state['invoice_amount']:.2f}"
-    subject_input = st.text_input("Email Subject", value=subject)
+    default_subject = (
+        f"PCard_Simon Group_AMOUNT_{st.session_state['invoice_amount']:.2f}"
+    )
+    subject_input = st.text_input("Email Subject", value=default_subject)
 
     default_body = (
-        f"Hi {to_name_string}.\n\n"
-        f"This is {purchaser_name} from Jon Simon group, we have a new purchase with PCard.\n\n"
-        f"Amount: ${st.session_state['invoice_amount']:.2f}\n"
-        f"Rationale: {st.session_state['invoice_rationale']}\n"
-        f"Account: {grant_code}\n\n"
+        f"Hi {', '.join(selected_to_names)},\n\n"
+        f"This is {purchaser_name} from Jon Simon group. Here are the purchase details:\n\n"
+        f"**Total Amount**: ${st.session_state['invoice_amount']:.2f}\n"
+        f"**Rationale**: {st.session_state['invoice_rationale']}\n"
+        f"**Account**: {grant_code}\n\n"
         f"Best,\n{purchaser_name}\n"
-        f"---------------------\n"
-        f"This is an automated email generated by LLM, please reply to {purchaser_name} ({purchaser_email}) for any questions.\n"
+        "---------------------\n"
+        f"This is an automated email generated by LLM, please reply to {purchaser_email} for any questions.\n"
     )
-    body_input = st.text_area("Email Body", default_body, height=240)
+    body_input = st.text_area("Email Body", value=default_body, height=240)
 
     # ----------------------
-    # F) Send Email Button
+    # H) Send Email Button
     # ----------------------
     if st.button("Send Email"):
-        if not uploaded_invoice:
-            st.error("Please upload an invoice first.")
+        if not uploaded_invoices:
+            st.error("Please upload invoice(s) first.")
+        elif (
+            st.session_state["invoice_amount"] == 0
+            and not st.session_state["invoice_rationale"]
+        ):
+            st.warning(
+                "Please run 'Process with LLM' first so we have valid invoice data."
+            )
         else:
             if not to_emails:
-                st.error("No valid To recipients. Please select at least one contact.")
+                st.error("No valid 'To' recipients selected.")
             else:
+                st.info("Sending email...")
                 try:
-                    st.info("Sending email...")
                     send_email_via_gmail(
                         to_emails=to_emails,
                         cc_emails=cc_emails,
                         subject=subject_input,
                         body=body_input,
-                        attachment_file=uploaded_invoice,
+                        attachment_files=uploaded_invoices,  # Attach all PDFs
                     )
                     st.success("Email sent successfully!")
                 except Exception as e:
