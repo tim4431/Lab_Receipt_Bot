@@ -136,7 +136,7 @@ def summarize_rationales_with_llm(rationales_list):
     st.info("Summarizing multiple invoices...")
     try:
         prompt_text = (
-            "Please describe the main thing of the purchase in a very precise sentence.\n\n"
+            "Please describe the main thing of the purchase in a very precise sentence, use ... and ... to describe them. \n\n"
             "Here are the rationales:\n"
             + "\n".join(f"- {rat}" for rat in rationales_list)
         )
