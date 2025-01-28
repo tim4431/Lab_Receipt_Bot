@@ -20,6 +20,7 @@ with open("config.yaml", "r", encoding="utf-8") as f:
     config_data = yaml.safe_load(f)
 
 INVOICE_ANALYSIS_PROMPT = config_data["invoice_analysis_prompt"]
+SUMMARY_PROMPT = config_data["summary_prompt"]
 CONTACTS = config_data["contacts"]  # single list of contacts
 GRANTS = config_data["grants"]  # single list of grants
 
@@ -64,58 +65,54 @@ def parse_invoice_pdf_with_gpt4o(uploaded_pdf):
     images = convert_from_bytes(pdf_bytes)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        amounts = []
-        rationales = []
+        # only process the first page
+        # for idx, img in enumerate(images):
+        # Save page to disk
+        idx = 0
+        img = images[0]
+        page_path = os.path.join(tmp_dir, f"page_{idx+1}.png")
+        img.save(page_path, "PNG")
 
-        for idx, img in enumerate(images):
-            # Save page to disk
-            page_path = os.path.join(tmp_dir, f"page_{idx+1}.png")
-            img.save(page_path, "PNG")
+        # Convert to base64
+        base64_image = encode_image(page_path)
 
-            # Convert to base64
-            base64_image = encode_image(page_path)
-
-            # Send request to GPT-4o
-            response = client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": INVOICE_ANALYSIS_PROMPT,
+        # Send request to GPT-4o
+        response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": INVOICE_ANALYSIS_PROMPT,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}"
                             },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{base64_image}"
-                                },
-                            },
-                        ],
-                    }
-                ],
-                response_format=Invoice,
-            )
+                        },
+                    ],
+                }
+            ],
+            response_format=Invoice,
+        )
+        page_result = response.choices[0].message.content.strip()
+    #
+    try:
+        parsed = json.loads(page_result)
+        amt_str = parsed.get("amount", 0.0)
+        rat = parsed.get("rationale", "")
+        amount = float(amt_str)
+        rationale = str(rat)
+        st.success(f"**Parsed Amount:** ${amount:,.2f}")
+        st.success(f"**Rationale:** {rationale}")
 
-            page_result = response.choices[0].message.content.strip()
-            try:
-                parsed = json.loads(page_result)
-                amt_str = parsed.get("amount", 0.0)
-                rat = parsed.get("rationale", "")
-                amounts.append(float(amt_str))
-                rationales.append(rat)
-            except Exception as e:
-                amounts.append(0.0)
-                rationales.append(f"Error parsing page {idx+1}: {e}")
-
-        # Summation across all pages of a single PDF
-        final_amount = sum(amounts)
-        final_rationale = " | ".join(rationales)
-        st.success(f"**Parsed Amount:** ${final_amount:,.2f}")
-        st.success(f"**Rationale:** {final_rationale}")
-
-    return final_amount, final_rationale
+        return amount, rationale
+    except Exception as e:
+        st.error(f"Error parsing invoice: {e}")
+        return 0.0, ""
 
 
 def parse_invoice_with_llm(uploaded_file):
@@ -128,18 +125,14 @@ def parse_invoice_with_llm(uploaded_file):
         raise ValueError("Unsupported file type. Please upload a PDF.")
 
 
-def summarize_rationales_with_llm(rationales_list):
+def summarize_rationales_with_llm(rationales):
     """
     GPT call to produce a single-sentence summary describing the main purchase,
     including the manufacturer or brand, from multiple rationales.
     """
     st.info("Summarizing multiple invoices...")
     try:
-        prompt_text = (
-            "Please describe the main thing of the purchase in a very precise sentence, use ... and ... to describe them. \n\n"
-            "Here are the rationales:\n"
-            + "\n".join(f"- {rat}" for rat in rationales_list)
-        )
+        prompt_text = SUMMARY_PROMPT + "\n".join(f" - {rat}" for rat in rationales)
 
         response = client.beta.chat.completions.parse(
             model="gpt-4o-mini",
@@ -173,27 +166,25 @@ def parse_multiple_invoices_with_llm(uploaded_files):
     if st.session_state.get("parsed_files_hash") == new_files_hash:
         # Return existing results
         return (
-            st.session_state["invoice_amount"],
+            st.session_state["invoice_amounts"],
             st.session_state["invoice_rationale"],
             new_files_hash,
         )
 
     # Otherwise, parse from scratch
-    total_amount = 0.0
-    all_rationales = []
+    amounts = []
+    rationales = []
     for f in uploaded_files:
-        amt, rat = parse_invoice_with_llm(f)
-        total_amount += amt
-        all_rationales.append(rat)
+        amount, rationale = parse_invoice_with_llm(f)
+        amounts.append(amount)
+        rationales.append(rationale)
 
     # If only one file, just use its single rationale
     if len(uploaded_files) == 1:
-        combined_rationale_summary = all_rationales[0]
+        return amounts, rationales[0], new_files_hash
     else:
-        # Summarize multiple rationales into one single-sentence summary
-        combined_rationale_summary = summarize_rationales_with_llm(all_rationales)
-
-    return total_amount, combined_rationale_summary, new_files_hash
+        rationale_summary = summarize_rationales_with_llm(rationales)
+        return amounts, rationale_summary, new_files_hash
 
 
 # ---------------------------
@@ -253,8 +244,10 @@ def run_streamlit_app():
     # ----------------------
     # Initialize Session Vars
     # ----------------------
-    if "invoice_amount" not in st.session_state:
-        st.session_state["invoice_amount"] = 0.0
+    if "invoice_amounts" not in st.session_state:
+        st.session_state["invoice_amounts"] = []
+    if "invoice_amount_sum" not in st.session_state:
+        st.session_state["invoice_amount_sum"] = 0.0
     if "invoice_rationale" not in st.session_state:
         st.session_state["invoice_rationale"] = ""
     if "parsed_files_hash" not in st.session_state:
@@ -301,25 +294,22 @@ def run_streamlit_app():
             st.error("Please upload at least one invoice first.")
         else:
             # Parse + Summarize
-            total_amount, final_summary, new_files_hash = (
-                parse_multiple_invoices_with_llm(uploaded_invoices)
+            amounts, rationale, new_files_hash = parse_multiple_invoices_with_llm(
+                uploaded_invoices
             )
 
             # Store results
-            st.session_state["invoice_amount"] = total_amount
-            st.session_state["invoice_rationale"] = final_summary
+            st.session_state["invoice_amounts"] = amounts
+            st.session_state["invoice_amount_sum"] = sum(amounts)
+            st.session_state["invoice_rationale"] = rationale
             st.session_state["parsed_files_hash"] = new_files_hash
 
             # Show results
-            if total_amount > 0:
-                st.success(f"**Combined Amount:** ${total_amount:,.2f}")
-            else:
-                st.warning("No valid amount parsed.")
-
-            if final_summary:
-                st.success("**Rationale**:\n" f"{final_summary}")
-            else:
-                st.warning("No rationale parsed or summarized.")
+            if len(amounts) > 1:
+                st.success(
+                    f"**Combined Amount:** ${st.session_state['invoice_amount_sum']:,.2f}"
+                )
+                st.success(f"**Rationale**: {rationale}")
 
     # ----------------------
     # E) Grant Selection
@@ -347,19 +337,48 @@ def run_streamlit_app():
             cc_emails.append(c["email"])
 
     # ----------------------
-    # G) Subject & Body
+    # G) Invoice Amount
+    # ----------------------
+    # display <text_input> "+" <text_input> for user to update
+    len_invoice_amounts = len(st.session_state["invoice_amounts"])
+    if len_invoice_amounts > 0:
+        text_input_row = st.columns(
+            len_invoice_amounts * 2 + 1, gap="small", vertical_alignment="center"
+        )
+        text_input_vals = []
+        for idx in range(len_invoice_amounts):
+            uploaded_fileName = uploaded_invoices[idx].name
+            val = text_input_row[2 * idx].text_input(
+                uploaded_fileName,
+                value=f"{st.session_state['invoice_amounts'][idx]:.2f}",
+            )
+            text_input_vals.append(val)
+            if idx < len_invoice_amounts - 1:
+                text_input_row[2 * idx + 1].text("+")
+        st.session_state["invoice_amounts"] = [float(val) for val in text_input_vals]
+        st.session_state["invoice_amount_sum"] = sum(
+            st.session_state["invoice_amounts"]
+        )
+        if len_invoice_amounts > 1:
+            text_input_row[-2].text("=")
+            text_input_row[-1].text_input(
+                "Amount", f"{st.session_state['invoice_amount_sum']:.2f}"
+            )
+
+    # ----------------------
+    # H) Subject & Body
     # ----------------------
     default_subject = (
-        f"PCard_Simon Group_AMOUNT_{st.session_state['invoice_amount']:.2f}"
+        f"PCard_Simon Group_AMOUNT_{st.session_state['invoice_amount_sum']:.2f}"
     )
     subject_input = st.text_input("Email Subject", value=default_subject)
 
     default_body = (
         f"Hi {', '.join(selected_to_names)},\n\n"
         f"This is {purchaser_name} from Jon Simon group. Here are the purchase details:\n\n"
-        f"**Total Amount**: ${st.session_state['invoice_amount']:.2f}\n"
-        f"**Rationale**: {st.session_state['invoice_rationale']}\n"
-        f"**Account**: {grant_code}\n\n"
+        f"Amount: ${st.session_state['invoice_amount_sum']:.2f}\n"
+        f"Rationale: {st.session_state['invoice_rationale']}\n"
+        f"Account: {grant_code}\n\n"
         f"Best,\n{purchaser_name}\n"
         "---------------------\n"
         f"This is an automated email generated by LLM, please reply to {purchaser_email} for any questions.\n"
@@ -373,7 +392,7 @@ def run_streamlit_app():
         if not uploaded_invoices:
             st.error("Please upload invoice(s) first.")
         elif (
-            st.session_state["invoice_amount"] == 0
+            st.session_state["invoice_amounts"] == 0
             and not st.session_state["invoice_rationale"]
         ):
             st.warning(
