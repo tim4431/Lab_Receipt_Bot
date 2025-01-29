@@ -8,7 +8,10 @@ from email.message import EmailMessage
 import streamlit as st
 import base64
 import tempfile
+import pyperclip
 from pydantic import BaseModel
+import datetime
+import time
 
 from pdf2image import convert_from_bytes  # pip install pdf2image
 from openai import OpenAI
@@ -23,6 +26,7 @@ INVOICE_ANALYSIS_PROMPT = config_data["invoice_analysis_prompt"]
 SUMMARY_PROMPT = config_data["summary_prompt"]
 CONTACTS = config_data["contacts"]  # single list of contacts
 GRANTS = config_data["grants"]  # single list of grants
+SPREADSHEET_LINK = config_data["spreadsheet_link"]
 
 with open("secret.yaml", "r", encoding="utf-8") as f:
     secrets_data = yaml.safe_load(f)
@@ -30,6 +34,7 @@ with open("secret.yaml", "r", encoding="utf-8") as f:
 OPENAI_APIKEY = secrets_data["openai_api_key"]
 SENDER_USERNAME = secrets_data["sender_username"]  # e.g. "myaccount@gmail.com"
 SENDER_PASSWORD = secrets_data["sender_password"]  # MUST be an App Password
+COMPANY = ""
 
 
 # ----------------------------
@@ -38,6 +43,7 @@ SENDER_PASSWORD = secrets_data["sender_password"]  # MUST be an App Password
 class Invoice(BaseModel):
     amount: float
     rationale: str
+    company: str
 
 
 # Instantiate the special "gpt-4o" client
@@ -58,6 +64,7 @@ def parse_invoice_pdf_with_gpt4o(uploaded_pdf):
     2) For each page, call GPT with the base64 image for invoice info.
     3) Sum up amounts & combine rationales for the entire PDF.
     """
+    global COMPANY
     st.info(f"Processing invoices: {uploaded_pdf.name}")
     pdf_bytes = uploaded_pdf.read()
     uploaded_pdf.seek(0)  # reset pointer so we can re-attach the file
@@ -104,8 +111,12 @@ def parse_invoice_pdf_with_gpt4o(uploaded_pdf):
         parsed = json.loads(page_result)
         amt_str = parsed.get("amount", 0.0)
         rat = parsed.get("rationale", "")
+        comp = parsed.get("company", "")
         amount = float(amt_str)
         rationale = str(rat)
+        company = str(comp)
+        COMPANY = company
+        st.info(f"**Parsed Company:** {company}")
         st.success(f"**Parsed Amount:** ${amount:,.2f}")
         st.success(f"**Rationale:** {rationale}")
 
@@ -412,6 +423,29 @@ def run_streamlit_app():
                         attachment_files=uploaded_invoices,  # Attach all PDFs
                     )
                     st.success("Email sent successfully!")
+                    #
+                    try:
+
+                        # print to clipboard
+                        # |  | Date of Purchase (ex:01/26) | Purchaser's name | Vendor Name | Amount | Date Received | Notes |
+                        copied_str = (
+                            "\t {:s} \t {:s} \t {:s} \t {:s} \t {:s} \t {:s}".format(
+                                datetime.datetime.now().strftime("%m/%d"),
+                                purchaser_name,
+                                COMPANY,
+                                f"{st.session_state['invoice_amount_sum']:.2f}",
+                                "",
+                                st.session_state["invoice_rationale"],
+                            )
+                        )
+                        pyperclip.copy(copied_str)
+                        st.success(f"Succesfully copied to clipboard: {copied_str}")
+                        time.sleep(0.5)
+                        # open the link
+                        st.write(f"Click [here]({SPREADSHEET_LINK}) for PCard Tracker")
+                    except Exception as e:
+                        st.error(f"Error copying to clipboard: {e}")
+
                 except Exception as e:
                     st.error(f"Error sending email: {e}")
 

@@ -3,3 +3,4 @@ pydantic
 pdf2image
 openai
 pyyaml
+pyperclip
