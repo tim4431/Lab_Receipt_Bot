@@ -384,8 +384,11 @@ def run_streamlit_app():
     )
     subject_input = st.text_input("Email Subject", value=default_subject)
 
+    selected_to_names_no_purchaser = [
+        name for name in selected_to_names if name != purchaser_name
+    ]
     default_body = (
-        f"Hi {', '.join(selected_to_names)},\n\n"
+        f"Hi {', '.join(selected_to_names_no_purchaser)},\n\n"
         f"This is {purchaser_name} from Jon Simon group. Here are the purchase details:\n\n"
         f"Amount: ${st.session_state['invoice_amount_sum']:.2f}\n"
         f"Rationale: {st.session_state['invoice_rationale']}\n"

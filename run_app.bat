@@ -1,1 +1,1 @@
-streamlit run app_streamlit.py
+conda activate getter && streamlit run app_streamlit.py
